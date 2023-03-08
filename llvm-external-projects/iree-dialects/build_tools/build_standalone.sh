@@ -17,7 +17,7 @@ llvm_project_dir="$repo_root/third_party/llvm-project"
 build_dir="$project_dir/build"
 
 cmake -GNinja -B"$build_dir" "$llvm_project_dir/llvm" \
-  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_BUILD_TYPE=Debug \
   -DLLVM_ENABLE_PROJECTS=mlir \
   -DLLVM_EXTERNAL_PROJECTS=iree-dialects \
   -DLLVM_EXTERNAL_IREE_DIALECTS_SOURCE_DIR="$project_dir" \

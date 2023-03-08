@@ -81,6 +81,7 @@ iree_check_single_backend_test_suite(
     "attention.mlir"
     "reverse.mlir"
     "scan.mlir"
+    "select_and_scatter.mlir"
     "scatter.mlir"
     "softmax.mlir"
     "sort.mlir"

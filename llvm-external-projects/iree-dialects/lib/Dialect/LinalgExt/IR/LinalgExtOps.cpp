@@ -40,6 +40,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/SMLoc.h"
+#include <iostream>
 
 using namespace mlir;
 using namespace mlir::iree_compiler::IREE::LinalgExt;
@@ -119,6 +120,425 @@ static bool isSmallerThan(ArrayRef<int64_t> sourceShape,
       });
 }
 
+//===----------------------------------------------------------------------===//
+// SelectAndScatterOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult SelectAndScatterOp::verify() {
+  Operation *op = getOperation();
+  if (getNumInputs() != 3) {
+    return op->emitOpError("expected three input operands");
+  }
+  if (getNumOutputs() != 1) {
+    return op->emitOpError("expected exactly one output operand");
+  }
+
+  auto originalType = getOriginalType();
+  auto sourceType = getSourceType();
+  if (originalType.getElementType() != sourceType.getElementType()) {
+    return op->emitOpError("operand and source have the same element type");
+  }
+
+  // Region: select and scatter
+  Region &select = this->getSelect();
+  Region &scatter = this->getScatter();
+  Block *selectbody = &select.front();
+  Block *scatterbody = &scatter.front();
+  if (selectbody->getNumArguments() != 2 ||
+      scatterbody->getNumArguments() != 2) {
+    return op->emitOpError("expected region to have two arguments");
+  }
+
+  Type arg0Type = selectbody->getArgument(0).getType();
+  Type arg1Type = selectbody->getArgument(1).getType();
+  Type arg2Type = scatterbody->getArgument(0).getType();
+  Type arg3Type = scatterbody->getArgument(1).getType();
+  if (!arg0Type.isIntOrFloat() || !arg1Type.isIntOrFloat() ||
+      !arg2Type.isIntOrFloat() || !arg3Type.isIntOrFloat()) {
+    return op->emitOpError(
+        "expected region to have scalar argument of integer or float types");
+  }
+
+  if (arg1Type != originalType.getElementType()) {
+    return op->emitOpError("mismatch in argument 1 of select's region ")
+           << arg1Type << " and element type of original value "
+           << originalType.getElementType();
+  }
+
+  if (arg3Type != originalType.getElementType()) {
+    return op->emitOpError("mismatch in argument 3 of scatter's region ")
+           << arg3Type << " and element type of original value "
+           << originalType.getElementType();
+  }
+
+  if (arg0Type != arg1Type) {
+    return op->emitOpError("mismatch in select's region argument types ")
+           << arg0Type << " and " << arg1Type;
+  }
+  if (arg2Type != arg3Type) {
+    return op->emitOpError("mismatch in scatter's region argument types ")
+           << arg2Type << " and " << arg3Type;
+  }
+
+  auto yieldOpOfSelect =
+      cast<IREE::LinalgExt::YieldOp>(selectbody->getTerminator());
+  if (yieldOpOfSelect->getNumOperands() != 1) {
+    return yieldOpOfSelect.emitOpError(
+        "expected select's region to yield a single value");
+  }
+  auto yieldedTypeOfSelect =
+      yieldOpOfSelect.getOperand(0).getType().dyn_cast<IntegerType>();
+  if (!yieldedTypeOfSelect || yieldedTypeOfSelect.getWidth() != 1) {
+    return yieldOpOfSelect.emitOpError("mismatch in type of yielded value ")
+           << yieldedTypeOfSelect << " and argument of the select's region "
+           << arg3Type;
+  }
+
+  auto yieldOpOfScatter =
+      cast<IREE::LinalgExt::YieldOp>(scatterbody->getTerminator());
+  if (yieldOpOfScatter->getNumOperands() != 1) {
+    return yieldOpOfScatter.emitOpError(
+        "expected scatter's region to yield a single value");
+  }
+  auto yieldedTypeOfScatter = yieldOpOfScatter->getOperand(0).getType();
+  if (yieldedTypeOfScatter != arg3Type) {
+    return yieldOpOfScatter.emitOpError("mismatch in type of yielded value ")
+           << yieldedTypeOfScatter << " and argument of the scatter's region "
+           << arg3Type;
+  }
+
+  return success();
+}
+
+SmallVector<utils::IteratorType> SelectAndScatterOp::getLoopIteratorTypes() {
+  // only include N and C, both parallel
+  SmallVector<utils::IteratorType> iteratorTypes(getOriginalType().getRank(),
+                                                 utils::IteratorType::parallel);
+  return iteratorTypes;
+}
+
+SmallVector<Range> SelectAndScatterOp::getIterationDomain(OpBuilder &builder) {
+  Location loc = getLoc();
+  Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
+  Value one = builder.create<arith::ConstantIndexOp>(loc, 1);
+  SmallVector<Range> ranges{};
+  SmallVector<int64_t> window_dimensions_ =
+      llvm::to_vector(getWindowDimensionsAttr().getValues<int64_t>());
+  SmallVector<int64_t> window_strides_ =
+      llvm::to_vector(getWindowStridesAttr().getValues<int64_t>());
+  SmallVector<int64_t> padding_ =
+      llvm::to_vector(getPaddingAttr().getValues<int64_t>());
+
+  // iteration info for H-axis, pad_top = padding_[dim_h*2], pad_bottom =
+  // padding_[dim_h*2+1]
+  AffineExpr sym0, sym1, sym2, sym3;
+  bindSymbols(builder.getContext(), sym0, sym1, sym2, sym3);
+  AffineMap map = AffineMap::get(/*dimCount=*/0, /*symbolCount=*/4,
+                                 {sym0 + sym1 - sym2 + sym3});
+  int dim_h = 1;
+  Value lb_h =
+      builder.create<arith::ConstantIndexOp>(loc, -padding_[dim_h * 2]);
+  Value input_h = getDimValue(builder, loc, original(), dim_h);
+  Value pad_bottom =
+      builder.create<arith::ConstantIndexOp>(loc, padding_[dim_h * 2 + 1]);
+  Value window_h =
+      builder.create<arith::ConstantIndexOp>(loc, window_dimensions_[dim_h]);
+  Value ub_h = builder.create<AffineApplyOp>(
+      loc, map, ValueRange{input_h, pad_bottom, window_h, one});
+  Value stride_h =
+      builder.create<arith::ConstantIndexOp>(loc, window_strides_[dim_h]);
+
+  // iteration info for W-axis, pad_left = padding_[dim_w*2], pad_right =
+  // padding_[dim_w*2+1]
+  int dim_w = 2;
+  Value lb_w =
+      builder.create<arith::ConstantIndexOp>(loc, -padding_[dim_w * 2]);
+  Value input_w = getDimValue(builder, loc, original(), dim_w);
+  Value pad_right =
+      builder.create<arith::ConstantIndexOp>(loc, padding_[dim_w * 2 + 1]);
+  Value window_w =
+      builder.create<arith::ConstantIndexOp>(loc, window_dimensions_[dim_w]);
+  Value ub_w = builder.create<AffineApplyOp>(
+      loc, map, ValueRange{input_w, pad_right, window_w, one});
+  Value stride_w =
+      builder.create<arith::ConstantIndexOp>(loc, window_strides_[dim_w]);
+
+  ranges.emplace_back(
+      Range{zero, getDimValue(builder, loc, original(), 0), one});
+  ranges.emplace_back(
+      Range{zero, getDimValue(builder, loc, original(), 3), one});
+  ranges.emplace_back(Range{lb_h, ub_h, stride_h});
+  ranges.emplace_back(Range{lb_w, ub_w, stride_w});
+  return ranges;
+}
+
+SmallVector<Operation *>
+SelectAndScatterOp::getTiledImplementation(OpBuilder &builder,
+                                           ArrayRef<OpFoldResult> offsets,
+                                           ArrayRef<OpFoldResult> sizes) {
+  // only tile N-axis and C-axis
+  SmallVector<Type> resultTypes;
+  SmallVector<Value> tiledOperands;
+  auto originalRank = getOriginalType().getRank();
+  auto zeroAttr = builder.getIndexAttr(0);
+  auto oneAttr = builder.getIndexAttr(1);
+  SmallVector<OpFoldResult> strides(originalRank, oneAttr);
+  SmallVector<OpFoldResult> originalOffsets;
+  SmallVector<OpFoldResult> originalSizes;
+  SmallVector<OpFoldResult> sourceSizes;
+  originalOffsets.emplace_back(offsets[0]);
+  originalOffsets.emplace_back(zeroAttr);
+  originalOffsets.emplace_back(zeroAttr);
+  originalOffsets.emplace_back(offsets[1]);
+
+  originalSizes.emplace_back(sizes[0]); // N
+  originalSizes.emplace_back(
+      builder.getIndexAttr(getOriginalType().getShape()[1])); // H
+  originalSizes.emplace_back(
+      builder.getIndexAttr(getOriginalType().getShape()[2])); // W
+  originalSizes.emplace_back(sizes[1]);                       // C
+
+  sourceSizes.emplace_back(sizes[0]); // N
+  sourceSizes.emplace_back(
+      builder.getIndexAttr(getSourceType().getShape()[1])); // H
+  sourceSizes.emplace_back(
+      builder.getIndexAttr(getSourceType().getShape()[2])); // W
+  sourceSizes.emplace_back(sizes[1]);                       // C
+
+  tiledOperands.emplace_back(getSlice(builder, getLoc(), original(),
+                                      originalOffsets, originalSizes, strides));
+  tiledOperands.emplace_back(getSlice(builder, getLoc(), source(),
+                                      originalOffsets, sourceSizes, strides));
+  tiledOperands.emplace_back(init());
+  tiledOperands.emplace_back(getSlice(builder, getLoc(), output(),
+                                      originalOffsets, originalSizes, strides));
+  resultTypes.push_back(tiledOperands[3].getType());
+
+  Operation *tiledSelectAndScatterOp =
+      mlir::clone(builder, getOperation(), resultTypes, tiledOperands);
+  return {tiledSelectAndScatterOp};
+}
+
+LogicalResult SelectAndScatterOp::getResultTilePosition(
+    OpBuilder &builder, unsigned resultNumber, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes, SmallVector<OpFoldResult> &resultOffsets,
+    SmallVector<OpFoldResult> &resultSizes) {
+  resultOffsets.emplace_back(offsets[0]);
+  resultOffsets.emplace_back(builder.getIndexAttr(0));
+  resultOffsets.emplace_back(builder.getIndexAttr(0));
+  resultOffsets.emplace_back(offsets[1]);
+
+  resultSizes.emplace_back(sizes[0]);
+  resultSizes.emplace_back(
+      builder.getIndexAttr(getOriginalType().getShape()[1]));
+  resultSizes.emplace_back(
+      builder.getIndexAttr(getOriginalType().getShape()[2]));
+  resultSizes.emplace_back(sizes[1]);
+  return success();
+}
+
+// shape N, H, W, C
+// for n = 0 to N, 1
+//     for c = 0 to C, 1
+//         out = 0 // shape input_h * input_w
+//         for i = -pad_top to input_h + pad_bottom - window_h + 1 , stride_h //
+//         scfFor_h
+//             for j = -pad_left to input_w + pad_right - window_w + 1, stride_w
+//             // scfFor_w
+//                 idx_i=0;
+//                 idx_j=0;
+//                 max=-maxvalue;
+//                 for k = 0 to window_h, 1 // scfFor_i
+//                     for l = 0 to window_w, 1 // scfFor_j
+//                         if(i+k>=0 and i+k<input_h and j+l>=0 and
+//                         j+l<input_w){ // scfIf_1
+//                             if(operand[n][i+k][j+l][c] > max){ // scfIf_2
+//                                 max = operand[n][i+k][j+l][c];
+//                                 idx_i=k;
+//                                 idx_j=l;
+//                             }
+//                         }
+//                 out[n][i+idx_i][j+idx_j][c] +=
+//                     source[n][(i+pad_top)/stride_h][(j+pad_left)/stride_w][c];
+
+static Value getNegInf(OpBuilder &b, Location loc, Type originalType) {
+  Attribute negInfAttr;
+  if (auto intType = originalType.dyn_cast<IntegerType>()) {
+    negInfAttr =
+        b.getIntegerAttr(intType, APInt::getSignedMinValue(intType.getWidth()));
+  } else {
+    auto negApFloat =
+        APFloat::getInf(originalType.cast<FloatType>().getFloatSemantics(),
+                        /*Negative=*/true);
+    negInfAttr = b.getFloatAttr(originalType, negApFloat);
+  }
+  return b.create<arith::ConstantOp>(loc, negInfAttr);
+}
+
+LogicalResult SelectAndScatterOp::generateScalarImplementation(OpBuilder &b,
+                                                               Location loc,
+                                                               ValueRange ivs) {
+
+  SmallVector<int64_t> window_dimensions_ =
+      llvm::to_vector(getWindowDimensionsAttr().getValues<int64_t>());
+  SmallVector<int64_t> window_strides_ =
+      llvm::to_vector(getWindowStridesAttr().getValues<int64_t>());
+  SmallVector<int64_t> padding_ =
+      llvm::to_vector(getPaddingAttr().getValues<int64_t>());
+
+  Value idx_i = b.create<arith::ConstantIndexOp>(loc, 0);
+  Value idx_j = b.create<arith::ConstantIndexOp>(loc, 0);
+  Type originalType = getOriginalType().getElementType();
+  Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
+  Value one = b.create<arith::ConstantIndexOp>(loc, 1);
+  Value zero_int = b.create<mlir::arith::ConstantIntOp>(loc, 0, 32);
+  int dim_h = 1;
+  int dim_w = 2;
+
+  Value stride_h =
+      b.create<arith::ConstantIndexOp>(loc, window_strides_[dim_h]);
+  Value stride_w =
+      b.create<arith::ConstantIndexOp>(loc, window_strides_[dim_w]);
+  // iteration info for axis i,j of window
+  Value ub_i = b.create<arith::ConstantIndexOp>(loc, window_dimensions_[dim_h]);
+  Value ub_j = b.create<arith::ConstantIndexOp>(loc, window_dimensions_[dim_w]);
+
+  // alloc buffer to store max, idx_i, idx_j when select
+  auto idx_memrefType = MemRefType::get(ArrayRef<int64_t>{2}, b.getIndexType());
+  Value idx_buffer = b.create<memref::AllocaOp>(loc, idx_memrefType);
+#if 1
+  // set max_values to negative infinity
+  Value max = getNegInf(b, loc, originalType);
+  auto max_memrefType = MemRefType::get(ArrayRef<int64_t>{1}, max.getType());
+  Value max_buffer = b.create<memref::AllocaOp>(loc, max_memrefType);
+#endif
+
+  AffineExpr sym0_, sym1_, sym2_;
+  bindSymbols(b.getContext(), sym0_, sym1_, sym2_);
+  AffineMap map_ = AffineMap::get(/*dimCount=*/0, /*symbolCount=*/3,
+                                  {(sym0_ + sym1_).floorDiv(sym2_)});
+
+  scf::ForOp scfFor_i, scfFor_j;
+  scf::IfOp scfIf_1, scfIf_2;
+  // init max and idx_i, idx_j as 0
+  b.create<memref::StoreOp>(loc, idx_i, idx_buffer, zero);
+  b.create<memref::StoreOp>(loc, idx_j, idx_buffer, one);
+  b.create<memref::StoreOp>(loc, max, max_buffer, zero);
+  // select
+  scfFor_i = b.create<scf::ForOp>(
+      loc, zero, ub_i, one, ValueRange{},
+      [&](OpBuilder &b, Location loc, Value iv_i, ValueRange iters) {
+        scfFor_j = b.create<scf::ForOp>(
+            loc, zero, ub_j, one, ValueRange{},
+            [&](OpBuilder &b, Location loc, Value iv_j, ValueRange iters) {
+              Value h_plus_i = b.create<arith::AddIOp>(loc, ivs[2], iv_i);
+              Value h_plus_i_int = b.create<arith::IndexCastOp>(
+                  loc, b.getIntegerType(32), h_plus_i);
+              Value w_plus_j = b.create<arith::AddIOp>(loc, ivs[3], iv_j);
+              Value w_plus_j_int = b.create<arith::IndexCastOp>(
+                  loc, b.getIntegerType(32), w_plus_j);
+              Value condition_top = b.create<arith::CmpIOp>(
+                  loc, arith::CmpIPredicate::sge, h_plus_i_int, zero_int);
+              Value condition_bottom = b.create<arith::CmpIOp>(
+                  loc, arith::CmpIPredicate::slt, h_plus_i,
+                  getDimValue(b, loc, original(), dim_h));
+              Value condition_h =
+                  b.create<arith::AndIOp>(loc, condition_top, condition_bottom);
+              Value condition_left = b.create<arith::CmpIOp>(
+                  loc, arith::CmpIPredicate::sge, w_plus_j_int, zero_int);
+              Value condition_right = b.create<arith::CmpIOp>(
+                  loc, arith::CmpIPredicate::slt, w_plus_j,
+                  getDimValue(b, loc, original(), dim_w));
+              Value condition_w =
+                  b.create<arith::AndIOp>(loc, condition_left, condition_right);
+              Value condition =
+                  b.create<arith::AndIOp>(loc, condition_h, condition_w);
+              ;
+              scfIf_1 = b.create<scf::IfOp>(
+                  loc, condition,
+                  [&](OpBuilder &b, Location loc) {
+                    SmallVector<Value> loadIndices;
+                    loadIndices.emplace_back(ivs[0]); // N-axis
+                    loadIndices.emplace_back(
+                        b.create<arith::AddIOp>(loc, ivs[2], iv_i));
+                    loadIndices.emplace_back(
+                        b.create<arith::AddIOp>(loc, ivs[3], iv_j));
+                    loadIndices.emplace_back(ivs[1]); // C-axis
+                    Value select_input =
+                        b.create<memref::LoadOp>(loc, original(), loadIndices);
+                    Value max_ =
+                        b.create<memref::LoadOp>(loc, max_buffer, zero);
+                    Value condition_;
+                    if (originalType.isa<FloatType>())
+                      condition_ = b.create<arith::CmpFOp>(
+                          loc, mlir::arith::CmpFPredicate::OGT, select_input,
+                          max_);
+                    if (auto integerType = originalType.dyn_cast<IntegerType>())
+                      condition_ = b.create<arith::CmpIOp>(
+                          loc, mlir::arith::CmpIPredicate::sgt, select_input,
+                          max_);
+
+                    scfIf_2 = b.create<scf::IfOp>(
+                        loc, condition_,
+                        [&](OpBuilder &b, Location loc) {
+                          b.create<memref::StoreOp>(loc, select_input,
+                                                    max_buffer, zero);
+                          b.create<memref::StoreOp>(loc, iv_i, idx_buffer,
+                                                    zero);
+                          b.create<memref::StoreOp>(loc, iv_j, idx_buffer, one);
+                          b.create<scf::YieldOp>(loc);
+                        },
+                        [&](OpBuilder &b, Location loc) {
+                          b.create<scf::YieldOp>(loc);
+                        });
+                    b.create<scf::YieldOp>(loc);
+                  },
+                  [&](OpBuilder &b, Location loc) {
+                    b.create<scf::YieldOp>(loc);
+                  });
+              b.create<scf::YieldOp>(loc);
+            }); // end for j
+        b.create<scf::YieldOp>(loc);
+      }); // end for i
+
+  // get source value
+  SmallVector<Value> SourceIndices;
+  Value pad_top = b.create<arith::ConstantIndexOp>(loc, padding_[dim_h * 2]);
+  Value pad_left = b.create<arith::ConstantIndexOp>(loc, padding_[dim_w * 2]);
+  SourceIndices.emplace_back(ivs[0]); // N-axis
+  SourceIndices.emplace_back(b.create<AffineApplyOp>(
+      loc, map_, ValueRange{ivs[2], pad_top, stride_h}));
+  SourceIndices.emplace_back(b.create<AffineApplyOp>(
+      loc, map_, ValueRange{ivs[3], pad_left, stride_w}));
+  SourceIndices.emplace_back(ivs[1]); // C-axis
+  Value scatter_value = b.create<memref::LoadOp>(loc, source(), SourceIndices);
+
+  // scatter to output
+  idx_i = b.create<memref::LoadOp>(loc, idx_buffer, zero);
+  idx_j = b.create<memref::LoadOp>(loc, idx_buffer, one);
+  // get the source value and scatter in out
+  SmallVector<Value> ScatterIndices;
+  ScatterIndices.emplace_back(ivs[0]);
+  ScatterIndices.emplace_back(b.create<arith::AddIOp>(loc, ivs[2], idx_i));
+  ScatterIndices.emplace_back(b.create<arith::AddIOp>(loc, ivs[3], idx_j));
+  ScatterIndices.emplace_back(ivs[1]);
+  Value value_in_outbuffer =
+      b.create<memref::LoadOp>(loc, output(), ScatterIndices);
+  if (originalType.isa<FloatType>())
+    scatter_value =
+        b.create<arith::AddFOp>(loc, scatter_value, value_in_outbuffer);
+  if (auto integerType = originalType.dyn_cast<IntegerType>())
+    scatter_value =
+        b.create<arith::AddIOp>(loc, scatter_value, value_in_outbuffer);
+  b.create<memref::StoreOp>(loc, scatter_value, output(), ScatterIndices);
+  return success();
+}
+
+LogicalResult SelectAndScatterOp::reifyResultShapes(
+    OpBuilder &b, ReifiedRankedShapedTypeDims &reifiedReturnShapes) {
+  return cast<LinalgExtOp>(getOperation())
+      .reifyResultShapes(b, reifiedReturnShapes);
+}
 //===----------------------------------------------------------------------===//
 // ScatterOp
 //===----------------------------------------------------------------------===//
@@ -470,6 +890,7 @@ SmallVector<utils::IteratorType> SortOp::getLoopIteratorTypes() {
 }
 
 SmallVector<Range> SortOp::getIterationDomain(OpBuilder &builder) {
+  // Operation *op = getOperation();
   int64_t operandRank = getOperandRank();
   SmallVector<Range> loopBounds(operandRank);
   Location loc = getLoc();
@@ -2632,6 +3053,7 @@ LogicalResult AttentionOp::reifyResultShapes(
                    outputBuffers);                                             \
   }
 
+DEFINE_OP_GET_EFFECTS(SelectAndScatterOp)
 DEFINE_OP_GET_EFFECTS(ScatterOp)
 DEFINE_OP_GET_EFFECTS(SortOp)
 DEFINE_OP_GET_EFFECTS(FftOp)

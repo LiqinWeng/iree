@@ -64,7 +64,12 @@ static LogicalResult checkStackAllocationSize(func::FuncOp funcOp) {
       }
       return allocaOp.emitOpError("expected no unbounded stack allocations");
     }
-    allocaSize *= allocaType.getElementType().getIntOrFloatBitWidth();
+    // FIXME: get the indexType bitwidth, as  memref<2xindex>
+    if (allocaType.getElementType().isSignlessIntOrIndexOrFloat()) {
+      allocaSize *= 32;
+    } else {
+      allocaSize *= allocaType.getElementType().getIntOrFloatBitWidth();
+    }
     if (allocaOp.getAlignment()) {
       int64_t alignmentInBits = *allocaOp.getAlignment() * 8;
       allocaSize =

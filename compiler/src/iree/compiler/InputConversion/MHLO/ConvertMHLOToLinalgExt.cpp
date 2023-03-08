@@ -161,6 +161,7 @@ struct SortOpConversion : public OpConversionPattern<mhlo::SortOp> {
             .failed()) {
       return failure();
     };
+
     auto sortOp = rewriter.create<IREE::LinalgExt::SortOp>(
         loc, resultTypes,
         /*inputs=*/ValueRange{}, adaptor.getOperands(),
@@ -179,6 +180,82 @@ struct SortOpConversion : public OpConversionPattern<mhlo::SortOp> {
     rewriter.applySignatureConversion(&region, signature_converter);
 
     rewriter.replaceOp(mhloSortOp, sortOp->getResults());
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// SelectAndScatterOp
+//===----------------------------------------------------------------------===//
+
+struct SelectAndScatterOpConversion
+    : public OpConversionPattern<mhlo::SelectAndScatterOp> {
+  using OpConversionPattern<mhlo::SelectAndScatterOp>::OpConversionPattern;
+  LogicalResult matchAndRewrite(
+      mhlo::SelectAndScatterOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const final {
+    ImplicitLocOpBuilder builder(op.getLoc(), rewriter);
+
+    Value original = op.getOperand();
+    Value source = op.getSource();
+    Value init = op.getInitValue();
+
+    auto originalTy = original.getType().dyn_cast<RankedTensorType>();
+    auto sourceTy = source.getType().dyn_cast<RankedTensorType>();
+    auto initTy = init.getType().dyn_cast<RankedTensorType>();
+    auto resultTy = op.getResult().getType().dyn_cast<RankedTensorType>();
+    if (!sourceTy || !originalTy || !initTy || !resultTy) return failure();
+
+    // Set for default values for windowStrideAttr/paddingAttr
+    int64_t originalRank = op.getType().dyn_cast<ShapedType>().getRank();
+    SmallVector<Attribute> zero(originalRank * 2, builder.getI64IntegerAttr(0));
+    SmallVector<Attribute> one(originalRank, builder.getI64IntegerAttr(1));
+    mlir::DenseIntElementsAttr windowStridesAttr, paddingAttr;
+    Optional<DenseIntElementsAttr> windowStrides = adaptor.getWindowStrides();
+    Optional<DenseIntElementsAttr> padding = adaptor.getPadding();
+    if (!padding.has_value()) {
+      Type paddingType =
+          RankedTensorType::get({originalRank, 2}, rewriter.getI64Type());
+      paddingAttr = mlir::DenseIntElementsAttr::get(paddingType, zero);
+    } else {
+      paddingAttr = op.getPaddingAttr();
+    }
+    if (!windowStrides.has_value()) {
+      Type strideType =
+          RankedTensorType::get({originalRank}, rewriter.getI64Type());
+      windowStridesAttr = mlir::DenseIntElementsAttr::get(strideType, one);
+    } else {
+      windowStridesAttr = op.getWindowStridesAttr();
+    }
+
+    SmallVector<Value> dynSizes;
+    Value outputTensor = builder.create<tensor::EmptyOp>(
+        originalTy.getShape(), originalTy.getElementType(), dynSizes);
+    Value initScalar = builder.create<tensor::ExtractOp>(
+        initTy.getElementType(), init, ValueRange{});
+    Value outputInit =
+        builder.create<linalg::FillOp>(initScalar, outputTensor).getResult(0);
+    auto selectandscatterOp =
+        rewriter.replaceOpWithNewOp<IREE::LinalgExt::SelectAndScatterOp>(
+            op, op->getResultTypes(), adaptor.getOperands(), outputInit,
+            op.getWindowDimensionsAttr(), windowStridesAttr, paddingAttr);
+
+    // set the iree_linalg_ext.select_and_scatter op's regions
+    rewriter.inlineRegionBefore(op.getSelect(), selectandscatterOp.getSelect(),
+                                selectandscatterOp.getSelect().begin());
+    rewriter.inlineRegionBefore(op.getScatter(),
+                                selectandscatterOp.getScatter(),
+                                selectandscatterOp.getScatter().begin());
+
+    Region &selectRegion = selectandscatterOp.getSelect();
+    Region &scatterRegion = selectandscatterOp.getScatter();
+    TypeConverter::SignatureConversion signatureConverter(2);
+    Type argType = getElementTypeOrSelf(original.getType());
+    signatureConverter.addInputs(1, argType);
+    signatureConverter.addInputs(0, argType);
+    rewriter.applySignatureConversion(&selectRegion, signatureConverter);
+    rewriter.applySignatureConversion(&scatterRegion, signatureConverter);
+
     return success();
   }
 };
@@ -544,9 +621,9 @@ struct ConvertMHLOToLinalgExtPass
     MLIRContext *context = &getContext();
 
     MhloToStdTypeConverter typeConverter;
-    patterns.insert<SortOpConversion, ScatterOpConversion, FftOpConversion,
-                    ReverseOpConversion, TopkOpConversion>(typeConverter,
-                                                           context);
+    patterns.insert<SelectAndScatterOpConversion, SortOpConversion,
+                    ScatterOpConversion, FftOpConversion, ReverseOpConversion,
+                    TopkOpConversion>(typeConverter, context);
     // FIXME: It shouldn't be necessary to list every matching MHLO op here,
     // especially since they're already listed in
     // populateHLOToLinalgConversionPattern and in HloOpToStdScalarOp. These

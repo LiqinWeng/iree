@@ -223,6 +223,7 @@ iree_check_single_backend_test_suite(
     "torch_index_select.mlir"
     "transpose.mlir"
     "while.mlir"
+    "select_and_scatter.mlir"
   TARGET_BACKEND
     "llvm-cpu"
   DRIVER

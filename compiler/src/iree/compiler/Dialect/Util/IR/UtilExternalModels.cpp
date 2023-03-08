@@ -127,6 +127,8 @@ void registerUtilExternalModels(DialectRegistry &registry) {
   // tricky because LinalgExtOps.td includes YieldOp.
   registry.addExtension(
       +[](MLIRContext *ctx, LinalgExt::IREELinalgExtDialect *dialect) {
+        LinalgExt::SelectAndScatterOp::attachInterface<
+            LinalgOpTiedOpInterface<LinalgExt::SelectAndScatterOp>>(*ctx);
         LinalgExt::ScatterOp::attachInterface<
             LinalgOpTiedOpInterface<LinalgExt::ScatterOp>>(*ctx);
         LinalgExt::SortOp::attachInterface<

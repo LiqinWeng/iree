@@ -58,6 +58,94 @@ class IREELinalgExt_Op<string mnemonic, list<Trait> traits = []> :
 //===----------------------------------------------------------------------===//
 // Non-structured ops
 //===----------------------------------------------------------------------===//
+def IREELinalgExt_SelectAndScatterOp :IREELinalgExt_Op<"select_and_scatter",
+    [DeclareOpInterfaceMethods<ReifyRankedShapedTypeOpInterface>,
+    DeclareOpInterfaceMethods<TilingInterface,
+        [
+         "generateScalarImplementation",
+         "getIterationDomain",
+         "getLoopIteratorTypes",
+         "getResultTilePosition",
+         "getTiledImplementation"
+        ]>
+      ]> {
+  let summary = "Select and Scatter operator";
+  let description = [{
+    // TODO
+    Runs a windowed selection `select` function over `operand` with shape
+    `window_dimensions` and stride `window_strides`. This will produce an amount
+    of selected locations whose shape matches `source`. These are then scattered
+    to the output which is initialized with `init_value`.
+    Multiple scattered elements which land in the same output location are
+    combined using the `scatter` function.
+
+    See https://www.tensorflow.org/xla/operation_semantics#selectandscatter.
+  }];
+
+  let arguments = (ins
+      Variadic<AnyType>:$inputs,
+      Variadic<AnyRankedTensorOrMemRefType>:$outputs,
+      OptionalAttr<I64ElementsAttr>:$window_dimensions,
+      OptionalAttr<I64ElementsAttr>:$window_strides,
+      OptionalAttr<I64ElementsAttr>:$padding
+  );
+
+  let results = (outs Variadic<AnyRankedTensor>:$results);
+  let regions = (region SizedRegion<1>:$select, SizedRegion<1>:$scatter);
+  // `ins` `(` $inputs `,` $init `:` type($inputs) `,` type($init)`)`
+  let assemblyFormat = [{
+    attr-dict `window_dimensions` `=` $window_dimensions
+              `window_strides` `=` $window_strides
+              `padding` `=` $padding
+    `ins` `(` $inputs `:` type($inputs)`)`
+    `outs` `(` $outputs `:` type($outputs) `)`
+    $select `,` $scatter (`->` type($results)^)?
+  }];
+
+  let extraClassDeclaration = extraLinalgExtOpClassDeclaration # [{
+    Value original() {
+      return getInputOperand(0)->get();
+    }
+
+    ShapedType getOriginalType() {
+      return original().getType().cast<ShapedType>();
+    }
+
+    Value source() {
+      return getInputOperand(1)->get();
+    }
+
+    ShapedType getSourceType() {
+      return source().getType().cast<ShapedType>();
+    }
+
+    Value init() {
+      return getInputOperand(2)->get();
+    }
+
+    RankedTensorType getInitType() {
+      return init().getType().dyn_cast<RankedTensorType>();
+    }
+
+    Value output() {
+      return getOutputOperand(0)->get();
+    }
+
+    ShapedType getOutputType() {
+      return output().getType().cast<ShapedType>();
+    }
+
+    // Method to implement for specifying output range for
+    // DestinationStyleOpInterface
+    std::pair<int64_t, int64_t> getDpsInitsPositionRange() {
+      std::pair<unsigned, unsigned> outputsIndexAndLength =
+        getODSOperandIndexAndLength(1);
+      return std::make_pair<int64_t, int64_t>(
+          outputsIndexAndLength.first,
+          outputsIndexAndLength.first + outputsIndexAndLength.second);
+    }
+  }];
+}
 
 def IREELinalgExt_ScatterOp : IREELinalgExt_Op<"scatter",
     [DeclareOpInterfaceMethods<ReifyRankedShapedTypeOpInterface>,

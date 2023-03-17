@@ -263,10 +263,15 @@ SmallVector<Range> SelectAndScatterOp::getIterationDomain(OpBuilder &builder) {
   Value stride_w =
       builder.create<arith::ConstantIndexOp>(loc, window_strides_[dim_w]);
 
+  /*   Value dimensionsh = builder.create<arith::ConstantIndexOp>(loc,
+    window_dimensions_[1]); Value dimensionsw =
+    builder.create<arith::ConstantIndexOp>(loc, window_dimensions_[2]); */
   ranges.emplace_back(
       Range{zero, getDimValue(builder, loc, original(), 0), one});
   ranges.emplace_back(
       Range{zero, getDimValue(builder, loc, original(), 3), one});
+  /*  ranges.emplace_back(Range{lb_h, dimensionsh, stride_h});
+   ranges.emplace_back(Range{lb_w, dimensionsw, stride_w}); */
   ranges.emplace_back(Range{lb_h, ub_h, stride_h});
   ranges.emplace_back(Range{lb_w, ub_w, stride_w});
   return ranges;
@@ -277,6 +282,9 @@ SelectAndScatterOp::getTiledImplementation(OpBuilder &builder,
                                            ArrayRef<OpFoldResult> offsets,
                                            ArrayRef<OpFoldResult> sizes) {
   // only tile N-axis and C-axis
+  SmallVector<int64_t> window_dimensions_ =
+      llvm::to_vector(getWindowDimensionsAttr().getValues<int64_t>());
+  Location loc = getLoc();
   SmallVector<Type> resultTypes;
   SmallVector<Value> tiledOperands;
   auto originalRank = getOriginalType().getRank();
@@ -285,30 +293,45 @@ SelectAndScatterOp::getTiledImplementation(OpBuilder &builder,
   SmallVector<OpFoldResult> strides(originalRank, oneAttr);
   SmallVector<OpFoldResult> originalOffsets;
   SmallVector<OpFoldResult> originalSizes;
+  SmallVector<OpFoldResult> sourceOffsets;
   SmallVector<OpFoldResult> sourceSizes;
+  Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
+  Value offset_h =
+      builder.create<arith::MaxSIOp>(loc, offsets[2].get<Value>(), zero);
+  Value offset_w =
+      builder.create<arith::MaxSIOp>(loc, offsets[3].get<Value>(), zero);
+  Value dimensionsh =
+      builder.create<arith::ConstantIndexOp>(loc, window_dimensions_[1]);
+  Value dimensionsw =
+      builder.create<arith::ConstantIndexOp>(loc, window_dimensions_[2]);
+  Value dimensions_h =
+      builder.create<arith::MinSIOp>(loc, dimensionsh, sizes[2].get<Value>());
+  Value dimensions_w =
+      builder.create<arith::MinSIOp>(loc, dimensionsw, sizes[3].get<Value>());
   originalOffsets.emplace_back(offsets[0]);
-  originalOffsets.emplace_back(zeroAttr);
-  originalOffsets.emplace_back(zeroAttr);
+  originalOffsets.emplace_back(offset_h);
+  originalOffsets.emplace_back(offset_w);
   originalOffsets.emplace_back(offsets[1]);
 
   originalSizes.emplace_back(sizes[0]); // N
-  originalSizes.emplace_back(
-      builder.getIndexAttr(getOriginalType().getShape()[1])); // H
-  originalSizes.emplace_back(
-      builder.getIndexAttr(getOriginalType().getShape()[2])); // W
+  originalSizes.emplace_back(dimensions_h);
+  originalSizes.emplace_back(dimensions_w);
   originalSizes.emplace_back(sizes[1]);                       // C
 
+  sourceOffsets.emplace_back(offsets[0]);
+  sourceOffsets.emplace_back(zeroAttr);
+  sourceOffsets.emplace_back(zeroAttr);
+  sourceOffsets.emplace_back(offsets[1]);
+
   sourceSizes.emplace_back(sizes[0]); // N
-  sourceSizes.emplace_back(
-      builder.getIndexAttr(getSourceType().getShape()[1])); // H
-  sourceSizes.emplace_back(
-      builder.getIndexAttr(getSourceType().getShape()[2])); // W
+  sourceSizes.emplace_back(oneAttr);
+  sourceSizes.emplace_back(oneAttr);
   sourceSizes.emplace_back(sizes[1]);                       // C
 
   tiledOperands.emplace_back(getSlice(builder, getLoc(), original(),
                                       originalOffsets, originalSizes, strides));
   tiledOperands.emplace_back(getSlice(builder, getLoc(), source(),
-                                      originalOffsets, sourceSizes, strides));
+                                      sourceOffsets, sourceSizes, strides));
   tiledOperands.emplace_back(init());
   tiledOperands.emplace_back(getSlice(builder, getLoc(), output(),
                                       originalOffsets, originalSizes, strides));
@@ -319,20 +342,35 @@ SelectAndScatterOp::getTiledImplementation(OpBuilder &builder,
   return {tiledSelectAndScatterOp};
 }
 
+// flow.dispatch.tensor.store in TileAndDistributeToWorkgroups
 LogicalResult SelectAndScatterOp::getResultTilePosition(
     OpBuilder &builder, unsigned resultNumber, ArrayRef<OpFoldResult> offsets,
     ArrayRef<OpFoldResult> sizes, SmallVector<OpFoldResult> &resultOffsets,
     SmallVector<OpFoldResult> &resultSizes) {
+  SmallVector<int64_t> window_dimensions_ =
+      llvm::to_vector(getWindowDimensionsAttr().getValues<int64_t>());
+  Location loc = getLoc();
+  Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
+  Value offset_h =
+      builder.create<arith::MaxSIOp>(loc, offsets[2].get<Value>(), zero);
+  Value offset_w =
+      builder.create<arith::MaxSIOp>(loc, offsets[3].get<Value>(), zero);
+  Value dimensionsh =
+      builder.create<arith::ConstantIndexOp>(loc, window_dimensions_[1]);
+  Value dimensionsw =
+      builder.create<arith::ConstantIndexOp>(loc, window_dimensions_[2]);
+  Value dimensions_h =
+      builder.create<arith::MinSIOp>(loc, dimensionsh, sizes[2].get<Value>());
+  Value dimensions_w =
+      builder.create<arith::MinSIOp>(loc, dimensionsw, sizes[3].get<Value>());
   resultOffsets.emplace_back(offsets[0]);
-  resultOffsets.emplace_back(builder.getIndexAttr(0));
-  resultOffsets.emplace_back(builder.getIndexAttr(0));
+  resultOffsets.emplace_back(offset_h);
+  resultOffsets.emplace_back(offset_w);
   resultOffsets.emplace_back(offsets[1]);
 
   resultSizes.emplace_back(sizes[0]);
-  resultSizes.emplace_back(
-      builder.getIndexAttr(getOriginalType().getShape()[1]));
-  resultSizes.emplace_back(
-      builder.getIndexAttr(getOriginalType().getShape()[2]));
+  resultSizes.emplace_back(dimensions_h);
+  resultSizes.emplace_back(dimensions_w);
   resultSizes.emplace_back(sizes[1]);
   return success();
 }
